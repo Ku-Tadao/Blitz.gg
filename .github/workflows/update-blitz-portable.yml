@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   update-blitz:
@@ -115,11 +116,16 @@ jobs:
       - name: Commit and push changes
         if: steps.check_changes.outputs.has_changes == 'true'
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $date = Get-Date -Format "yyyy-MM-dd"
+          $branch = "bot/update-blitz-portable"
+          $repo = $env:GITHUB_REPOSITORY
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B $branch
 
           git commit -m "Update Blitz portable zip - $date"
           if ($LASTEXITCODE -ne 0) {
@@ -127,13 +133,48 @@ jobs:
             exit 1
           }
 
-          git push
+          git push --force --set-upstream origin $branch
           if ($LASTEXITCODE -ne 0) {
             Write-Error "Push failed"
             exit 1
           }
 
-          Write-Host "Changes committed and pushed successfully"
+          $prNumber = gh pr list `
+            --repo $repo `
+            --base dev `
+            --head $branch `
+            --state open `
+            --json number `
+            --jq '.[0].number'
+
+          $title = "Update Blitz portable zip - $date"
+          $body = "Automated portable zip refresh from workflow run $env:GITHUB_RUN_ID."
+
+          if ([string]::IsNullOrWhiteSpace($prNumber)) {
+            gh pr create `
+              --repo $repo `
+              --base dev `
+              --head $branch `
+              --title $title `
+              --body $body
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Failed to create PR"
+              exit 1
+            }
+          } else {
+            gh pr edit $prNumber `
+              --repo $repo `
+              --title $title `
+              --body $body
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Failed to update existing PR #$prNumber"
+              exit 1
+            }
+          }
+
+          Write-Host "Changes committed and PR into dev is ready"
 
       - name: No changes to commit
         if: steps.check_changes.outputs.has_changes == 'false'
