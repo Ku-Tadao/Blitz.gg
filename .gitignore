@@ -1,0 +1,8 @@
+.vs/
+**/bin/
+**/obj/
+*.user
+*.sln.DotSettings.user
+Logs/
+Publish/
+token.txt
