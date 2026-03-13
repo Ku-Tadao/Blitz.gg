@@ -1,0 +1,122 @@
+name: Release Troubleshooter
+
+on:
+  push:
+    branches:
+      - master
+      - main
+      - dev
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-troubleshooter-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Publish single-file executable
+        shell: pwsh
+        run: |
+          $project = "Troubleshooter/Blitz Troubleshooter.csproj"
+          $outputDir = "out/publish"
+
+          dotnet restore $project
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          dotnet publish $project `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -p:PublishTrimmed=false `
+            -o $outputDir
+
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          $publishedExe = Join-Path $outputDir "Blitz Troubleshooter.exe"
+          if (!(Test-Path $publishedExe)) {
+            Write-Error "Published executable not found at $publishedExe"
+            exit 1
+          }
+
+          $releaseAsset = "out/Blitz.Troubleshooter.exe"
+          Copy-Item $publishedExe $releaseAsset -Force
+
+          $sizeMb = [math]::Round(((Get-Item $releaseAsset).Length / 1MB), 2)
+          Write-Host "Release asset created: $releaseAsset ($sizeMb MB)"
+
+      - name: Create release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $branch = "${{ github.ref_name }}"
+          $isStable = $branch -in @("master", "main")
+          $track = if ($isStable) { "stable" } else { "dev" }
+          $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+          $shortSha = "${{ github.sha }}".Substring(0, 7)
+          $tag = "$track-$timestamp-$shortSha"
+          $title = if ($isStable) {
+            "Blitz Troubleshooter Stable $timestamp"
+          } else {
+            "Blitz Troubleshooter Dev $timestamp"
+          }
+
+          "branch=$branch" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "is_stable=$($isStable.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "title=$title" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create stable release (latest)
+        if: steps.meta.outputs.is_stable == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $title = "${{ steps.meta.outputs.title }}"
+          $notes = @"
+Automated stable release from branch `${{ steps.meta.outputs.branch }}`.
+Commit: ${{ github.sha }}
+"@
+
+          gh release create $tag "out/Blitz.Troubleshooter.exe" `
+            --repo $env:GITHUB_REPOSITORY `
+            --title $title `
+            --notes $notes `
+            --latest
+
+      - name: Create dev prerelease (not latest)
+        if: steps.meta.outputs.is_stable != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $title = "${{ steps.meta.outputs.title }}"
+          $notes = @"
+Automated dev prerelease from branch `${{ steps.meta.outputs.branch }}`.
+Commit: ${{ github.sha }}
+"@
+
+          gh release create $tag "out/Blitz.Troubleshooter.exe" `
+            --repo $env:GITHUB_REPOSITORY `
+            --title $title `
+            --notes $notes `
+            --prerelease
