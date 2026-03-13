@@ -91,10 +91,7 @@ jobs:
         run: |
           $tag = "${{ steps.meta.outputs.tag }}"
           $title = "${{ steps.meta.outputs.title }}"
-          $notes = @"
-Automated stable release from branch `${{ steps.meta.outputs.branch }}`.
-Commit: ${{ github.sha }}
-"@
+          $notes = "Automated stable release from branch ${{ steps.meta.outputs.branch }}.`nCommit: ${{ github.sha }}"
 
           gh release create $tag "out/Blitz.Troubleshooter.exe" `
             --repo $env:GITHUB_REPOSITORY `
@@ -110,10 +107,7 @@ Commit: ${{ github.sha }}
         run: |
           $tag = "${{ steps.meta.outputs.tag }}"
           $title = "${{ steps.meta.outputs.title }}"
-          $notes = @"
-Automated dev prerelease from branch `${{ steps.meta.outputs.branch }}`.
-Commit: ${{ github.sha }}
-"@
+          $notes = "Automated dev prerelease from branch ${{ steps.meta.outputs.branch }}.`nCommit: ${{ github.sha }}"
 
           gh release create $tag "out/Blitz.Troubleshooter.exe" `
             --repo $env:GITHUB_REPOSITORY `
