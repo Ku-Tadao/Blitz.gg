@@ -131,23 +131,49 @@ jobs:
         run: |
           $blitzPath = "${{ steps.install_blitz.outputs.path }}"
           $outputZip = "Portable/blitzportable.zip"
+          $previousZip = Join-Path $env:RUNNER_TEMP "blitzportable.previous.zip"
 
           Write-Host "Creating portable zip from: $blitzPath"
           Write-Host "Output: $outputZip"
 
           if (Test-Path $outputZip) {
-            Remove-Item $outputZip -Force
-            Write-Host "Removed old zip file"
+            Move-Item $outputZip $previousZip -Force
           }
 
           Compress-Archive -Path "$blitzPath\*" -DestinationPath $outputZip -CompressionLevel Optimal
 
-          if (Test-Path $outputZip) {
-            $zipSize = (Get-Item $outputZip).Length / 1MB
-            Write-Host "Zip file created successfully: $([math]::Round($zipSize, 2)) MB"
-          } else {
+          if (!(Test-Path $outputZip)) {
             Write-Error "Failed to create zip file"
             exit 1
+          }
+
+          $zipSize = (Get-Item $outputZip).Length / 1MB
+          Write-Host "Zip file created successfully: $([math]::Round($zipSize, 2)) MB"
+
+          if (Test-Path $previousZip) {
+            function Get-ZipManifest($path) {
+              $archive = [IO.Compression.ZipFile]::OpenRead($path)
+              try {
+                foreach ($entry in $archive.Entries | Sort-Object FullName) {
+                  if ($entry.FullName.EndsWith("/")) { continue }
+                  $stream = $entry.Open()
+                  try {
+                    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream))
+                  } finally {
+                    $stream.Dispose()
+                  }
+                  "$($entry.FullName)|$($entry.Length)|$hash"
+                }
+              } finally {
+                $archive.Dispose()
+              }
+            }
+
+            $contentChanges = Compare-Object @(Get-ZipManifest $previousZip) @(Get-ZipManifest $outputZip)
+            if (!$contentChanges) {
+              Copy-Item $previousZip $outputZip -Force
+              Write-Host "Installed files are unchanged; restored the existing archive to avoid a metadata-only commit"
+            }
           }
 
       - name: Check for changes
