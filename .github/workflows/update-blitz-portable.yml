@@ -17,6 +17,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           token: ${{ secrets.MAINTAINER_PAT || github.token }}
+          lfs: true
 
       - name: Push token notice
         shell: pwsh
@@ -24,11 +25,6 @@ jobs:
           if ([string]::IsNullOrWhiteSpace("${{ secrets.MAINTAINER_PAT }}")) {
             Write-Warning "MAINTAINER_PAT is not configured. If master protection blocks GITHUB_TOKEN pushes, set MAINTAINER_PAT to a maintainer PAT with repo scope."
           }
-
-      - name: Set up Git LFS
-        shell: pwsh
-        run: |
-          git lfs install
 
       - name: Download Blitz installer
         shell: pwsh
