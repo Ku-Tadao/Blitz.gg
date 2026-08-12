@@ -4,20 +4,40 @@ on:
   schedule:
     - cron: "0 2 * * 1"
   workflow_dispatch:
+    inputs:
+      installer_url:
+        description: "Blitz installer URL (leave blank to use the current download)"
+        required: false
+        default: "https://blitz.gg/download/win"
+        type: string
+      publish:
+        description: "Publish the generated archive to the checked-out branch"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
 
+concurrency:
+  group: update-blitz-portable
+  cancel-in-progress: false
+
 jobs:
   update-blitz:
-    runs-on: windows-latest
+    runs-on: windows-2025
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           token: ${{ secrets.MAINTAINER_PAT || github.token }}
           lfs: true
+
+      - name: Initialize diagnostics
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "blitz-portable-diagnostics") -Force | Out-Null
 
       - name: Push token notice
         shell: pwsh
@@ -26,151 +46,125 @@ jobs:
             Write-Warning "MAINTAINER_PAT is not configured. If master protection blocks GITHUB_TOKEN pushes, set MAINTAINER_PAT to a maintainer PAT with repo scope."
           }
 
-      - name: Download Blitz installer
+      - name: Determine update mode
+        id: mode
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_INSTALLER_URL: ${{ inputs.installer_url || 'https://blitz.gg/download/win' }}
+          INPUT_PUBLISH: ${{ inputs.publish || 'false' }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          $isSchedule = $env:EVENT_NAME -eq "schedule"
+          $manualPublish = $env:INPUT_PUBLISH -eq "true"
+          $publish = $isSchedule -or $manualPublish
+
+          if ($publish -and $env:REF_NAME -ne $env:DEFAULT_BRANCH) {
+            throw "Publishing is only allowed from the default branch ($env:DEFAULT_BRANCH); current ref is $env:REF_NAME"
+          }
+
+          "installer_url=$env:INPUT_INSTALLER_URL" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "publish=$($publish.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Installer URL: $env:INPUT_INSTALLER_URL"
+          Write-Host "Publish mode: $publish"
+
+      - name: Prepare portable 7-Zip 26.02
+        id: seven_zip
         shell: pwsh
         run: |
-          Write-Host "Downloading Blitz installer..."
-          $url = "https://blitz.gg/download/win"
-          $output = "BlitzSetup.exe"
+          $toolRoot = Join-Path $env:RUNNER_TEMP "blitz-7zip-2602"
+          $archive = Join-Path $env:RUNNER_TEMP "7z2602-extra.7z"
+          $url = "https://www.7-zip.org/a/7z2602-extra.7z"
+          $expectedSha256 = "081DF9E9311DFD9C9E0E98C1C80180B99BB51E4CB24156B5F3057FE3C259D70A"
 
-          Invoke-WebRequest -Uri $url -OutFile $output -UseBasicParsing
-
-          if (!(Test-Path $output)) {
-            Write-Error "Failed to download Blitz installer"
-            exit 1
+          Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "7-Zip archive hash mismatch. Expected $expectedSha256, got $actualSha256"
           }
 
-          $installer = Get-Item $output
-          $signature = Get-AuthenticodeSignature $installer.FullName
-          $signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { "<none>" }
-
-          Write-Host "Installer version: $($installer.VersionInfo.ProductVersion)"
-          Write-Host "Installer size: $($installer.Length) bytes"
-          Write-Host "Installer SHA256: $((Get-FileHash $installer.FullName -Algorithm SHA256).Hash)"
-          Write-Host "Installer signature: $($signature.Status) ($signer)"
-
-          if ($installer.Length -eq 0 -or $signature.Status -ne "Valid") {
-            Write-Error "Downloaded installer is empty or has an invalid signature"
-            exit 1
+          $system7z = $null
+          foreach ($name in @("7z.exe", "7za.exe")) {
+            $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($command) {
+              $system7z = $command.Source
+              break
+            }
           }
-
-      - name: Install and verify Blitz
-        id: install_blitz
-        shell: pwsh
-        run: |
-          $installer = (Resolve-Path "BlitzSetup.exe").Path
-          $startedAt = Get-Date
-
-          Write-Host "Installing Blitz with NSIS silent mode..."
-          $process = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru -NoNewWindow
-          $duration = [math]::Round(((Get-Date) - $startedAt).TotalSeconds, 2)
-          Write-Host "Installer exit code: $($process.ExitCode)"
-          Write-Host "Installer duration: $duration seconds"
-
-          if ($process.ExitCode -ne 0) {
-            Write-Error "Blitz installer failed with exit code $($process.ExitCode)"
-            exit $process.ExitCode
-          }
-
-          $candidates = @(
-            (Join-Path $env:LOCALAPPDATA "Programs\Blitz")
-            (Join-Path $env:LOCALAPPDATA "Blitz")
-            (Join-Path $env:ProgramFiles "Blitz")
-            if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} "Blitz" }
-          ) | Select-Object -Unique
-
-          foreach ($candidate in $candidates) {
-            Write-Host "Candidate: $candidate (Blitz.exe: $(Test-Path (Join-Path $candidate 'Blitz.exe')))"
-          }
-
-          $blitzPath = $candidates |
-            Where-Object { Test-Path (Join-Path $_ "Blitz.exe") } |
-            Select-Object -First 1
-
-          if (!$blitzPath) {
-            Write-Host "::group::Blitz installation diagnostics"
-            Write-Host "User: $env:USERNAME"
-            Write-Host "LOCALAPPDATA: $env:LOCALAPPDATA"
-            Write-Host "ProgramFiles: $env:ProgramFiles"
-            Write-Host "ProgramFiles(x86): ${env:ProgramFiles(x86)}"
-
-            Get-Process -ErrorAction SilentlyContinue |
-              Where-Object { $_.ProcessName -like "*Blitz*" } |
-              Select-Object ProcessName, Id, Path
-
-            @("$env:LOCALAPPDATA\Programs", $env:ProgramFiles, ${env:ProgramFiles(x86)}) |
-              Where-Object { $_ -and (Test-Path $_) } |
-              ForEach-Object {
-                Get-ChildItem -Path $_ -Directory -ErrorAction SilentlyContinue |
-                  Where-Object { $_.Name -like "*Blitz*" } |
-                  Select-Object FullName, CreationTime, LastWriteTime
-              }
-
-            Get-WinEvent -FilterHashtable @{ LogName = "Application"; StartTime = $startedAt } -ErrorAction SilentlyContinue |
-              Where-Object { $_.Message -match "Blitz|Application Error" } |
-              Select-Object -First 20 TimeCreated, Id, ProviderName, Message
-            Write-Host "::endgroup::"
-
-            Write-Error "Installer exited successfully, but no verified Blitz.exe was found"
-            exit 1
-          }
-
-          $blitzExe = Get-Item (Join-Path $blitzPath "Blitz.exe")
-          Write-Host "Verified Blitz $($blitzExe.VersionInfo.ProductVersion) at $blitzPath"
-          Write-Host "::group::Installed files"
-          Get-ChildItem -Path $blitzPath -Recurse -Depth 1 | Select-Object FullName, Length, LastWriteTime
-          Write-Host "::endgroup::"
-          "path=$blitzPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Create portable zip
-        shell: pwsh
-        run: |
-          $blitzPath = "${{ steps.install_blitz.outputs.path }}"
-          $outputZip = "Portable/blitzportable.zip"
-          $previousZip = Join-Path $env:RUNNER_TEMP "blitzportable.previous.zip"
-
-          Write-Host "Creating portable zip from: $blitzPath"
-          Write-Host "Output: $outputZip"
-
-          if (Test-Path $outputZip) {
-            Move-Item $outputZip $previousZip -Force
-          }
-
-          Compress-Archive -Path "$blitzPath\*" -DestinationPath $outputZip -CompressionLevel Optimal
-
-          if (!(Test-Path $outputZip)) {
-            Write-Error "Failed to create zip file"
-            exit 1
-          }
-
-          $zipSize = (Get-Item $outputZip).Length / 1MB
-          Write-Host "Zip file created successfully: $([math]::Round($zipSize, 2)) MB"
-
-          if (Test-Path $previousZip) {
-            function Get-ZipManifest($path) {
-              $archive = [IO.Compression.ZipFile]::OpenRead($path)
-              try {
-                foreach ($entry in $archive.Entries | Sort-Object FullName) {
-                  if ($entry.FullName.EndsWith("/")) { continue }
-                  $stream = $entry.Open()
-                  try {
-                    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream))
-                  } finally {
-                    $stream.Dispose()
-                  }
-                  "$($entry.FullName)|$($entry.Length)|$hash"
+          if (!$system7z) {
+            $programRoots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
+            foreach ($root in $programRoots) {
+              foreach ($relativePath in @("7-Zip\7z.exe", "7-Zip\7za.exe")) {
+                $candidate = Join-Path $root $relativePath
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                  $system7z = $candidate
+                  break
                 }
-              } finally {
-                $archive.Dispose()
+              }
+              if ($system7z) {
+                break
               }
             }
-
-            $contentChanges = Compare-Object @(Get-ZipManifest $previousZip) @(Get-ZipManifest $outputZip)
-            if (!$contentChanges) {
-              Copy-Item $previousZip $outputZip -Force
-              Write-Host "Installed files are unchanged; restored the existing archive to avoid a metadata-only commit"
-            }
           }
+          if (!$system7z) {
+            throw "The Windows runner does not expose a system 7z.exe/7za.exe to unpack the pinned tool archive"
+          }
+
+          New-Item -ItemType Directory -Path $toolRoot -Force | Out-Null
+          & $system7z x $archive "-o$toolRoot" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to unpack portable 7-Zip with $system7z"
+          }
+
+          $sevenZip = Join-Path $toolRoot "7za.exe"
+          if (!(Test-Path -LiteralPath $sevenZip -PathType Leaf)) {
+            throw "Pinned 7-Zip archive did not contain 7za.exe"
+          }
+
+          $toolHash = (Get-FileHash -LiteralPath $sevenZip -Algorithm SHA256).Hash.ToUpperInvariant()
+          Write-Host "Portable 7-Zip SHA256: $toolHash"
+          "path=$sevenZip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Build portable candidate
+        id: build
+        shell: pwsh
+        env:
+          INSTALLER_URL: ${{ steps.mode.outputs.installer_url }}
+          PUBLISH: ${{ steps.mode.outputs.publish }}
+          SEVEN_ZIP: ${{ steps.seven_zip.outputs.path }}
+        run: |
+          $diagnostics = Join-Path $env:RUNNER_TEMP "blitz-portable-diagnostics"
+          $baseline = Join-Path $PWD "Portable\blitzportable.zip"
+          $output = if ($env:PUBLISH -eq "true") {
+            $baseline
+          }
+          else {
+            Join-Path $env:RUNNER_TEMP "blitzportable.candidate.zip"
+          }
+
+          $json = & "$PWD\scripts\Build-BlitzPortable.ps1" `
+            -InstallerUrl $env:INSTALLER_URL `
+            -OutputZip $output `
+            -BaselineZip $baseline `
+            -DiagnosticsDirectory $diagnostics `
+            -SevenZipPath $env:SEVEN_ZIP | Out-String
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Portable build script failed. See $diagnostics"
+          }
+
+          $result = $json | ConvertFrom-Json
+          if (!$result.Success) {
+            throw "Portable build script did not report success"
+          }
+
+          "changed=$($result.Changed.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "output=$output" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "payload_version=$($result.PayloadVersion)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Payload version: $($result.PayloadVersion)"
+          Write-Host "Payload files: $($result.PayloadFileCount)"
+          Write-Host "Content changed: $($result.Changed)"
 
       - name: Check for changes
         id: check_changes
@@ -179,43 +173,58 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add Portable/blitzportable.zip
-
+          git add -- Portable/blitzportable.zip
           git diff --staged --quiet
           if ($LASTEXITCODE -ne 0) {
             Write-Host "Changes detected"
-            "has_changes=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          } else {
-            Write-Host "No changes detected"
-            "has_changes=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "has_changes=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
-
-          exit 0
+          else {
+            Write-Host "No changes detected"
+            "has_changes=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
 
       - name: Commit and push changes
-        if: steps.check_changes.outputs.has_changes == 'true'
+        if: steps.mode.outputs.publish == 'true' && steps.check_changes.outputs.has_changes == 'true'
         shell: pwsh
+        env:
+          BRANCH: ${{ github.ref_name }}
         run: |
-          $date = Get-Date -Format "yyyy-MM-dd"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
+          $date = Get-Date -AsUTC -Format "yyyy-MM-dd"
           git commit -m "Update Blitz portable zip - $date"
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "Commit failed"
-            exit 1
+            throw "Commit failed"
           }
 
-          git push origin HEAD:master
+          git push origin "HEAD:$env:BRANCH"
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "Push failed"
-            exit 1
+            throw "Push failed"
           }
 
-          Write-Host "Changes committed and pushed to master successfully"
+          Write-Host "Changes committed and pushed to $env:BRANCH successfully"
 
       - name: No changes to commit
-        if: steps.check_changes.outputs.has_changes == 'false'
+        if: steps.mode.outputs.publish != 'true' || steps.check_changes.outputs.has_changes != 'true'
+        shell: pwsh
         run: |
-          Write-Host "Blitz portable zip is already up to date"
+          Write-Host "Dry-run completed or portable payload is already up to date"
+
+      - name: Upload candidate archive
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && steps.build.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: blitz-portable-candidate-${{ github.run_id }}
+          path: ${{ steps.build.outputs.output }}
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Upload manifests and diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: blitz-portable-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/blitz-portable-diagnostics
+          compression-level: 0
+          if-no-files-found: warn
+          retention-days: 7
