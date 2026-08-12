@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   update-blitz:
@@ -17,12 +16,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.MAINTAINER_PAT || github.token }}
+          lfs: true
 
-      - name: Set up Git LFS
+      - name: Push token notice
         shell: pwsh
         run: |
-          git lfs install
+          if ([string]::IsNullOrWhiteSpace("${{ secrets.MAINTAINER_PAT }}")) {
+            Write-Warning "MAINTAINER_PAT is not configured. If master protection blocks GITHUB_TOKEN pushes, set MAINTAINER_PAT to a maintainer PAT with repo scope."
+          }
 
       - name: Download Blitz installer
         shell: pwsh
@@ -33,64 +35,141 @@ jobs:
 
           Invoke-WebRequest -Uri $url -OutFile $output -UseBasicParsing
 
-          if (Test-Path $output) {
-            Write-Host "Downloaded successfully: $(Get-Item $output | Select-Object -ExpandProperty Length) bytes"
-          } else {
+          if (!(Test-Path $output)) {
             Write-Error "Failed to download Blitz installer"
             exit 1
           }
 
-      - name: Install Blitz
-        shell: pwsh
-        run: |
-          Write-Host "Installing Blitz..."
-          $installer = "BlitzSetup.exe"
+          $installer = Get-Item $output
+          $signature = Get-AuthenticodeSignature $installer.FullName
+          $signer = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { "<none>" }
 
-          Start-Process -FilePath $installer -ArgumentList "--silent" -Wait -NoNewWindow
+          Write-Host "Installer version: $($installer.VersionInfo.ProductVersion)"
+          Write-Host "Installer size: $($installer.Length) bytes"
+          Write-Host "Installer SHA256: $((Get-FileHash $installer.FullName -Algorithm SHA256).Hash)"
+          Write-Host "Installer signature: $($signature.Status) ($signer)"
 
-          Write-Host "Installation completed"
-          Start-Sleep -Seconds 10
-
-      - name: Locate and verify Blitz installation
-        shell: pwsh
-        run: |
-          $blitzPath = "$env:LOCALAPPDATA\Programs\Blitz"
-
-          Write-Host "Checking for Blitz installation at: $blitzPath"
-
-          if (Test-Path $blitzPath) {
-            Write-Host "Blitz installation found!"
-            Write-Host "Contents:"
-            Get-ChildItem -Path $blitzPath -Recurse -Depth 1 | Select-Object FullName
-          } else {
-            Write-Error "Blitz installation not found at expected location"
-            Write-Host "Searching for Blitz installation..."
-            Get-ChildItem -Path "$env:LOCALAPPDATA\Programs" -Directory | Select-Object FullName
+          if ($installer.Length -eq 0 -or $signature.Status -ne "Valid") {
+            Write-Error "Downloaded installer is empty or has an invalid signature"
             exit 1
           }
+
+      - name: Install and verify Blitz
+        id: install_blitz
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path "BlitzSetup.exe").Path
+          $startedAt = Get-Date
+
+          Write-Host "Installing Blitz with NSIS silent mode..."
+          $process = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru -NoNewWindow
+          $duration = [math]::Round(((Get-Date) - $startedAt).TotalSeconds, 2)
+          Write-Host "Installer exit code: $($process.ExitCode)"
+          Write-Host "Installer duration: $duration seconds"
+
+          if ($process.ExitCode -ne 0) {
+            Write-Error "Blitz installer failed with exit code $($process.ExitCode)"
+            exit $process.ExitCode
+          }
+
+          $candidates = @(
+            (Join-Path $env:LOCALAPPDATA "Programs\Blitz")
+            (Join-Path $env:LOCALAPPDATA "Blitz")
+            (Join-Path $env:ProgramFiles "Blitz")
+            if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} "Blitz" }
+          ) | Select-Object -Unique
+
+          foreach ($candidate in $candidates) {
+            Write-Host "Candidate: $candidate (Blitz.exe: $(Test-Path (Join-Path $candidate 'Blitz.exe')))"
+          }
+
+          $blitzPath = $candidates |
+            Where-Object { Test-Path (Join-Path $_ "Blitz.exe") } |
+            Select-Object -First 1
+
+          if (!$blitzPath) {
+            Write-Host "::group::Blitz installation diagnostics"
+            Write-Host "User: $env:USERNAME"
+            Write-Host "LOCALAPPDATA: $env:LOCALAPPDATA"
+            Write-Host "ProgramFiles: $env:ProgramFiles"
+            Write-Host "ProgramFiles(x86): ${env:ProgramFiles(x86)}"
+
+            Get-Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.ProcessName -like "*Blitz*" } |
+              Select-Object ProcessName, Id, Path
+
+            @("$env:LOCALAPPDATA\Programs", $env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+              Where-Object { $_ -and (Test-Path $_) } |
+              ForEach-Object {
+                Get-ChildItem -Path $_ -Directory -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -like "*Blitz*" } |
+                  Select-Object FullName, CreationTime, LastWriteTime
+              }
+
+            Get-WinEvent -FilterHashtable @{ LogName = "Application"; StartTime = $startedAt } -ErrorAction SilentlyContinue |
+              Where-Object { $_.Message -match "Blitz|Application Error" } |
+              Select-Object -First 20 TimeCreated, Id, ProviderName, Message
+            Write-Host "::endgroup::"
+
+            Write-Error "Installer exited successfully, but no verified Blitz.exe was found"
+            exit 1
+          }
+
+          $blitzExe = Get-Item (Join-Path $blitzPath "Blitz.exe")
+          Write-Host "Verified Blitz $($blitzExe.VersionInfo.ProductVersion) at $blitzPath"
+          Write-Host "::group::Installed files"
+          Get-ChildItem -Path $blitzPath -Recurse -Depth 1 | Select-Object FullName, Length, LastWriteTime
+          Write-Host "::endgroup::"
+          "path=$blitzPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Create portable zip
         shell: pwsh
         run: |
-          $blitzPath = "$env:LOCALAPPDATA\Programs\Blitz"
+          $blitzPath = "${{ steps.install_blitz.outputs.path }}"
           $outputZip = "Portable/blitzportable.zip"
+          $previousZip = Join-Path $env:RUNNER_TEMP "blitzportable.previous.zip"
 
           Write-Host "Creating portable zip from: $blitzPath"
           Write-Host "Output: $outputZip"
 
           if (Test-Path $outputZip) {
-            Remove-Item $outputZip -Force
-            Write-Host "Removed old zip file"
+            Move-Item $outputZip $previousZip -Force
           }
 
           Compress-Archive -Path "$blitzPath\*" -DestinationPath $outputZip -CompressionLevel Optimal
 
-          if (Test-Path $outputZip) {
-            $zipSize = (Get-Item $outputZip).Length / 1MB
-            Write-Host "Zip file created successfully: $([math]::Round($zipSize, 2)) MB"
-          } else {
+          if (!(Test-Path $outputZip)) {
             Write-Error "Failed to create zip file"
             exit 1
+          }
+
+          $zipSize = (Get-Item $outputZip).Length / 1MB
+          Write-Host "Zip file created successfully: $([math]::Round($zipSize, 2)) MB"
+
+          if (Test-Path $previousZip) {
+            function Get-ZipManifest($path) {
+              $archive = [IO.Compression.ZipFile]::OpenRead($path)
+              try {
+                foreach ($entry in $archive.Entries | Sort-Object FullName) {
+                  if ($entry.FullName.EndsWith("/")) { continue }
+                  $stream = $entry.Open()
+                  try {
+                    $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream))
+                  } finally {
+                    $stream.Dispose()
+                  }
+                  "$($entry.FullName)|$($entry.Length)|$hash"
+                }
+              } finally {
+                $archive.Dispose()
+              }
+            }
+
+            $contentChanges = Compare-Object @(Get-ZipManifest $previousZip) @(Get-ZipManifest $outputZip)
+            if (!$contentChanges) {
+              Copy-Item $previousZip $outputZip -Force
+              Write-Host "Installed files are unchanged; restored the existing archive to avoid a metadata-only commit"
+            }
           }
 
       - name: Check for changes
@@ -116,16 +195,11 @@ jobs:
       - name: Commit and push changes
         if: steps.check_changes.outputs.has_changes == 'true'
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           $date = Get-Date -Format "yyyy-MM-dd"
-          $branch = "bot/update-blitz-portable"
-          $repo = $env:GITHUB_REPOSITORY
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -B $branch
 
           git commit -m "Update Blitz portable zip - $date"
           if ($LASTEXITCODE -ne 0) {
@@ -133,48 +207,13 @@ jobs:
             exit 1
           }
 
-          git push --force --set-upstream origin $branch
+          git push origin HEAD:master
           if ($LASTEXITCODE -ne 0) {
             Write-Error "Push failed"
             exit 1
           }
 
-          $prNumber = gh pr list `
-            --repo $repo `
-            --base dev `
-            --head $branch `
-            --state open `
-            --json number `
-            --jq '.[0].number'
-
-          $title = "Update Blitz portable zip - $date"
-          $body = "Automated portable zip refresh from workflow run $env:GITHUB_RUN_ID."
-
-          if ([string]::IsNullOrWhiteSpace($prNumber)) {
-            gh pr create `
-              --repo $repo `
-              --base dev `
-              --head $branch `
-              --title $title `
-              --body $body
-
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "Failed to create PR"
-              exit 1
-            }
-          } else {
-            gh pr edit $prNumber `
-              --repo $repo `
-              --title $title `
-              --body $body
-
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "Failed to update existing PR #$prNumber"
-              exit 1
-            }
-          }
-
-          Write-Host "Changes committed and PR into dev is ready"
+          Write-Host "Changes committed and pushed to master successfully"
 
       - name: No changes to commit
         if: steps.check_changes.outputs.has_changes == 'false'
