@@ -184,6 +184,8 @@ jobs:
             "has_changes=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
 
+          exit 0
+
       - name: Commit and push changes
         if: steps.mode.outputs.publish == 'true' && steps.check_changes.outputs.has_changes == 'true'
         shell: pwsh
