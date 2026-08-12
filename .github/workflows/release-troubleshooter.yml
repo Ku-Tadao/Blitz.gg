@@ -6,6 +6,9 @@ on:
       - master
       - main
       - dev
+    paths:
+      - "Troubleshooter/**"
+  workflow_dispatch:
 
 permissions:
   contents: write
